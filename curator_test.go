@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -116,14 +117,13 @@ func TestCurate_FiltersLowRelevance(t *testing.T) {
 }
 
 func TestCurate_KeepsHighRelevance(t *testing.T) {
-	callNum := atomic.Int64{}
 	llm := &testLLM{
 		completeFunc: func(_ context.Context, req CompletionRequest) (*CompletionResponse, error) {
-			n := callNum.Add(1)
+			// Dispatch based on MaxTokens (order-independent for parallel calls)
 			switch {
-			case n%3 == 1:
+			case req.MaxTokens <= 10:
 				return &CompletionResponse{Content: "0.9"}, nil
-			case n%3 == 2:
+			case req.MaxTokens == 200:
 				return &CompletionResponse{Content: "Test summary"}, nil
 			default:
 				return &CompletionResponse{Content: "rust, programming"}, nil
@@ -170,18 +170,23 @@ func TestCurate_AllScoringFails(t *testing.T) {
 }
 
 func TestCurate_PartialFailure(t *testing.T) {
-	callNum := atomic.Int64{}
+	// First article succeeds all calls, second article fails scoring.
+	// Use prompt content to distinguish articles (order-independent).
 	llm := &testLLM{
-		completeFunc: func(_ context.Context, _ CompletionRequest) (*CompletionResponse, error) {
-			n := callNum.Add(1)
-			// First item scores, second fails
-			if n <= 3 { // score + summarize + tag for first item
-				if n == 1 {
-					return &CompletionResponse{Content: "0.9"}, nil
-				}
-				return &CompletionResponse{Content: "summary"}, nil
+		completeFunc: func(_ context.Context, req CompletionRequest) (*CompletionResponse, error) {
+			prompt := ""
+			if len(req.Messages) > 0 {
+				prompt = req.Messages[len(req.Messages)-1].Content
 			}
-			return nil, fmt.Errorf("provider intermittent failure")
+			// The "fails" article fails on scoring
+			if strings.Contains(prompt, "fails") && req.MaxTokens <= 10 {
+				return nil, fmt.Errorf("provider intermittent failure")
+			}
+			// Scoring
+			if req.MaxTokens <= 10 {
+				return &CompletionResponse{Content: "0.9"}, nil
+			}
+			return &CompletionResponse{Content: "summary"}, nil
 		},
 	}
 	c := NewCurator(llm)
@@ -300,6 +305,94 @@ func TestCurate_SingleResult(t *testing.T) {
 	}
 	if len(items) != 1 {
 		t.Errorf("expected 1 item, got %d", len(items))
+	}
+}
+
+func TestCurate_ParallelSummarizeAndTag(t *testing.T) {
+	// Verify that both Summarize and ExtractTags produce results for high-scoring articles.
+	// With parallel execution, both should complete even though they run concurrently.
+	callNum := atomic.Int64{}
+	llm := &testLLM{
+		completeFunc: func(_ context.Context, req CompletionRequest) (*CompletionResponse, error) {
+			n := callNum.Add(1)
+			// Scoring call (MaxTokens <= 10)
+			if req.MaxTokens <= 10 {
+				return &CompletionResponse{Content: "0.9"}, nil
+			}
+			// Summarize (MaxTokens = 200) and ExtractTags (MaxTokens = 50) run in parallel
+			if req.MaxTokens == 200 {
+				return &CompletionResponse{Content: "parallel summary"}, nil
+			}
+			if req.MaxTokens == 50 {
+				return &CompletionResponse{Content: "tag1, tag2"}, nil
+			}
+			return &CompletionResponse{Content: fmt.Sprintf("call-%d", n)}, nil
+		},
+	}
+	c := NewCurator(llm)
+
+	results := []SearchResult{
+		{Title: "Article", URL: "https://a.com", Snippet: "test", PublishedAt: time.Now()},
+	}
+
+	items, err := c.Curate(context.Background(), "test", results)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].Summary != "parallel summary" {
+		t.Errorf("summary = %q, want %q", items[0].Summary, "parallel summary")
+	}
+	if len(items[0].Tags) == 0 {
+		t.Error("expected tags to be populated from parallel ExtractTags call")
+	}
+	// 3 LLM calls: 1 score + 1 summarize + 1 tags
+	if got := llm.callCount.Load(); got != 3 {
+		t.Errorf("callCount = %d, want 3", got)
+	}
+}
+
+func TestCurate_ParallelPartialFailure(t *testing.T) {
+	// When one of Summarize/ExtractTags fails and the other succeeds in parallel,
+	// the successful result should still populate.
+	llm := &testLLM{
+		completeFunc: func(_ context.Context, req CompletionRequest) (*CompletionResponse, error) {
+			if req.MaxTokens <= 10 {
+				return &CompletionResponse{Content: "0.9"}, nil
+			}
+			// Summarize succeeds
+			if req.MaxTokens == 200 {
+				return &CompletionResponse{Content: "good summary"}, nil
+			}
+			// ExtractTags fails
+			if req.MaxTokens == 50 {
+				return nil, fmt.Errorf("tag extraction failed")
+			}
+			return &CompletionResponse{Content: "fallback"}, nil
+		},
+	}
+	c := NewCurator(llm)
+
+	results := []SearchResult{
+		{Title: "Article", URL: "https://a.com", Snippet: "test", PublishedAt: time.Now()},
+	}
+
+	items, err := c.Curate(context.Background(), "test", results)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	// Summary should be populated even though tags failed
+	if items[0].Summary != "good summary" {
+		t.Errorf("summary = %q, want %q", items[0].Summary, "good summary")
+	}
+	// Error should be set from the tag failure
+	if items[0].Error == nil {
+		t.Error("expected Error to be set from tag extraction failure")
 	}
 }
 

@@ -73,21 +73,40 @@ func (c *Curator) Curate(ctx context.Context, topic string, results []SearchResu
 			item.RelevanceScore = score
 
 			// Only summarize and tag items above threshold
+			// Summarize and ExtractTags are independent — run in parallel.
 			if score > c.cfg.relevanceThreshold {
-				summary, err := Summarize(ctx, c.llm, topic, r.Title, r.Content)
-				if err != nil {
-					item.Error = err
+				var innerWg sync.WaitGroup
+				innerWg.Add(2)
+
+				var summaryResult string
+				var summaryErr error
+				var tagsResult []string
+				var tagsErr error
+
+				go func() {
+					defer innerWg.Done()
+					summaryResult, summaryErr = Summarize(ctx, c.llm, topic, r.Title, r.Content)
+				}()
+
+				go func() {
+					defer innerWg.Done()
+					tagsResult, tagsErr = ExtractTags(ctx, c.llm, r.Title, r.Content)
+				}()
+
+				innerWg.Wait()
+
+				if summaryErr != nil {
+					item.Error = summaryErr
 				} else {
-					item.Summary = summary
+					item.Summary = summaryResult
 				}
 
-				tags, err := ExtractTags(ctx, c.llm, r.Title, r.Content)
-				if err != nil {
+				if tagsErr != nil {
 					if item.Error == nil {
-						item.Error = err
+						item.Error = tagsErr
 					}
 				} else {
-					item.Tags = tags
+					item.Tags = tagsResult
 				}
 			}
 

@@ -75,6 +75,31 @@ curator := engine.NewCurator(llm,
 )
 ```
 
+## Personalization
+
+The `taste` package adds LLM-native personalization. Feed behavioral signals, build a taste profile, and wrap any LLM provider for personalized scoring:
+
+```go
+import "github.com/oluoyefeso/termiflow-engine/taste"
+
+// Build a taste profile from user behavior.
+signals := []taste.Signal{
+    {ContentID: "a1", Kind: taste.SignalRead, Value: 0.9, Topics: []string{"go", "concurrency"}},
+    {ContentID: "a2", Kind: taste.SignalSkip, Value: 1.0, Topics: []string{"javascript"}},
+}
+profile := taste.UpdateProfile(nil, signals)
+
+// Wrap your LLM provider for personalized scoring.
+personalLLM := taste.PersonalizeScorer(yourLLM, profile)
+curator := engine.NewCurator(personalLLM)
+items, _ := curator.Curate(ctx, "daily digest", results)
+
+// Explain why content scored the way it did.
+explanation, _ := taste.Explain(ctx, yourLLM, profile, items[0].Title, items[0].RelevanceScore)
+```
+
+Taste profiles are JSON files you can inspect, edit, and version control. See `examples/personalized-curation` for a full walkthrough.
+
 ## Testing
 
 Use the `mock` package for deterministic testing without API keys:
@@ -91,6 +116,7 @@ search := mock.Search()
 - `examples/basic` — minimal curation pipeline
 - `examples/custom-scoring` — custom scoring prompt and config
 - `examples/ask` — question-answering with sources
+- `examples/personalized-curation` — taste profiles and personalized scoring
 
 Run any example: `go run ./examples/basic`
 
